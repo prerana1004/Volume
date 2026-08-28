@@ -1,77 +1,149 @@
 import os
 import subprocess
-import pandas as pd
+from datetime import date
 from concurrent.futures import ThreadPoolExecutor
 
-# Folder configuration
-script_dir = "/home/scripts/sql_queries/ace/"
+import pandas as pd
 
-# Get all database extraction shell scripts to run
-scripts = [f for f in os.listdir(script_dir) if f.endswith(".sh")]
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+
+# Scripts path
+script_dir = "/home/scripts/sql_queries/ace/Volume"
+
+# Single master workbook, one sheet per category (matches your existing tabs:
+# Servicewise_EXP, Servicewise_SYS, Serverwise_EXP, Serverwise_SYS, Portwise)
+master_path = os.path.join(script_dir, "master_report.xlsx")
+
+# Map: txt file (produced by the .sh script) -> (sheet name, index column label)
+# Adjust the left-hand filenames if yours differ in case/spelling.
+FILE_SHEET_MAP = {
+    "exp_service.txt": ("Servicewise_EXP", "Service Name"),
+    "sys_Service.txt": ("Servicewise_SYS", "Service Name"),
+    "exp_server.txt":  ("Serverwise_EXP",  "Server"),
+    "sys_server.txt":  ("Serverwise_SYS",  "Server"),
+    "exp_port.txt":    ("Portwise_EXP",    "Port"),
+    "sys_port.txt":    ("Portwise_SYS",    "Port"),
+}
+
+TODAY_COL = date.today().strftime("%-d-%b")  # e.g. "28-Aug"
+
+
+# ---------------------------------------------------------------------------
+# STEP 1: run all .sh scripts in parallel (unchanged from your original logic)
+# ---------------------------------------------------------------------------
+
+def get_scripts():
+    return [f for f in os.listdir(script_dir) if f.endswith(".sh")]
+
 
 def run_script(script):
-    """Runs a single shell script cleanly."""
     script_path = os.path.join(script_dir, script)
     subprocess.run(["bash", script_path])
 
-def build_data_dump_excel():
-    """Combines all 6 text files into ONE clean dump sheet for easy Excel VLOOKUP."""
-    print("Gathering data from all text extracts...")
-    txt_files = [f for f in os.listdir(script_dir) if f.endswith(".txt")]
-    
-    if not txt_files:
-        print("No data text files found!")
+
+def run_all_scripts():
+    scripts = get_scripts()
+    try:
+        with ThreadPoolExecutor() as executor:
+            print("getting the thread pool")
+            list(executor.map(run_script, scripts))  # list() forces wait for all to finish
+    except Exception as e:
+        print("was not able to query the result:", e)
+
+
+# ---------------------------------------------------------------------------
+# STEP 2: parse a key:value txt file into a pandas Series
+# ---------------------------------------------------------------------------
+
+def parse_txt(path):
+    """
+    Parses spool output in 'KEY:COUNT' format (one per line), e.g.:
+        4010:1523
+        4014:842
+    Adjust sep=":" below if a given file uses a different delimiter.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        print(f"[warn] missing or empty file: {path}")
+        return None
+
+    try:
+        df = pd.read_csv(
+            path,
+            sep=":",
+            header=None,
+            names=["Key", TODAY_COL],
+            engine="python",
+        )
+        df["Key"] = df["Key"].astype(str).str.strip()
+        return df.set_index("Key")[TODAY_COL]
+    except Exception as e:
+        print(f"[error] failed to parse {path}: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# STEP 3: merge each parsed series into the right sheet of the master workbook
+# ---------------------------------------------------------------------------
+
+def load_existing_sheet(sheet_name, index_label):
+    if not os.path.exists(master_path):
+        return None
+    try:
+        df = pd.read_excel(master_path, sheet_name=sheet_name, index_col=0)
+        df.index.name = index_label
+        return df
+    except (FileNotFoundError, ValueError):
+        # ValueError -> sheet doesn't exist yet
+        return None
+
+
+def update_all_sheets():
+    updated_sheets = {}
+
+    for txt_file, (sheet_name, index_label) in FILE_SHEET_MAP.items():
+        txt_path = os.path.join(script_dir, txt_file)
+        new_series = parse_txt(txt_path)
+        if new_series is None:
+            continue
+
+        existing = load_existing_sheet(sheet_name, index_label)
+
+        if existing is not None:
+            # Drop today's column if this script already ran once today (re-run safe)
+            existing = existing.drop(columns=[TODAY_COL], errors="ignore")
+            merged = existing.join(new_series, how="outer")
+        else:
+            merged = new_series.to_frame()
+
+        merged.index.name = index_label
+        merged = merged.sort_index()
+        updated_sheets[sheet_name] = merged
+
+    if not updated_sheets:
+        print("[warn] no sheets to update, skipping workbook write")
         return
 
-    # This creates a small temporary file you can download to your laptop
-    dump_excel_file = os.path.join(script_dir, "today_dump.xlsx")
-    
-    # We will combine all data into one single layout list
-    combined_master_list = []
-    
-    for txt_file in txt_files:
-        file_path = os.path.join(script_dir, txt_file)
-        
-        if os.path.getsize(file_path) == 0:
-            continue
-            
-        try:
-            # 1. Read raw comma data from the DB text file
-            df = pd.read_csv(file_path, sep=",", names=["MATCH_KEY", "VOLUME"])
-            
-            # 2. AUTOMATICALLY CLEAN DATA (Strip spaces and remove blanks)
-            df = df.dropna(subset=["MATCH_KEY"])
-            df["MATCH_KEY"] = df["MATCH_KEY"].astype(str).str.strip()
-            df = df[df["MATCH_KEY"] != ""]
-            
-            # Remove trailing decimals from numbers if any exist (e.g. '4013.0' -> '4013')
-            df["MATCH_KEY"] = df["MATCH_KEY"].apply(lambda x: x[:-2] if x.endswith(".0") else x)
-            
-            combined_master_list.append(df)
-            print(f"Successfully processed and cleaned text file: [{txt_file}]")
-            
-        except Exception as e:
-            print(f"Could not process file {txt_file}: {e}")
-            
-    if combined_master_list:
-        # Stack all 6 file contents on top of each other into one giant list
-        final_df = pd.concat(combined_master_list, ignore_index=True)
-        
-        # Save it into a single clean sheet
-        final_df.to_excel(dump_excel_file, sheet_name="Database_Data", index=False)
-        print(f"✨ Success! Your clean copy-paste dump file is ready at: {dump_excel_file}")
+    # Preserve any sheets not touched today by re-reading the existing workbook
+    if os.path.exists(master_path):
+        existing_book = pd.read_excel(master_path, sheet_name=None, index_col=0)
     else:
-        print("No valid database records were found to merge.")
+        existing_book = {}
+
+    existing_book.update(updated_sheets)
+
+    with pd.ExcelWriter(master_path, engine="openpyxl") as writer:
+        for sheet_name, df in existing_book.items():
+            df.to_excel(writer, sheet_name=sheet_name)
+
+    print(f"[ok] master workbook updated: {master_path}")
+
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    try:
-        # Step A: Run all queries in parallel
-        with ThreadPoolExecutor() as executor:
-            print("Running database queries...")
-            executor.map(run_script, scripts)
-            
-        # Step B: Clean and merge data into today_dump.xlsx
-        build_data_dump_excel()
-        
-    except Exception as overall_error:
-        print(f"Process crashed: {overall_error}")
+    run_all_scripts()
+    update_all_sheets()
