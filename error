@@ -10,17 +10,18 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 script_dir = "/home/scripts/sql_queries/ace/Volume"
-master_path = os.path.join(script_dir, "master_report.csv")  # <-- CSV, no openpyxl needed
 
-# Each combined txt file (one per query, e.g. exp_combined.txt, sys_combined.txt)
-# holding lines like: ServiceName:Port:Server:Count
-COMBINED_FILES = [
-    "exp_combined.txt",
-    "sys_combined.txt",
-]
+# Map: txt file produced by the .sh script -> (master csv filename, header label for column A)
+FILE_MAP = {
+    "exp_service.txt": ("Servicewise_EXP.csv", "Service Name"),
+    "sys_Service.txt": ("Servicewise_SYS.csv", "Service Name"),
+    "exp_server.txt":  ("Serverwise_EXP.csv",  "SERVER"),
+    "sys_server.txt":  ("Serverwise_SYS.csv",  "SERVER"),
+    "exp_port.txt":    ("Portwise_EXP.csv",    "PORT"),
+    "sys_port.txt":    ("Portwise_SYS.csv",    "PORT"),
+}
 
 TODAY_COL = date.today().strftime("%-d-%b")  # e.g. "28-Aug"
-KEY_COLS = ["Service Name", "Port", "Server"]
 
 
 # ---------------------------------------------------------------------------
@@ -46,10 +47,10 @@ def run_all_scripts():
 
 
 # ---------------------------------------------------------------------------
-# STEP 2: parse "Service:Port:Server:Count" lines into a DataFrame
+# STEP 2: parse a "KEY:COUNT" txt file into a pandas Series (today's column)
 # ---------------------------------------------------------------------------
 
-def parse_combined_file(path):
+def parse_txt(path):
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         print(f"[warn] missing or empty file: {path}")
         return None
@@ -58,53 +59,57 @@ def parse_combined_file(path):
             path,
             sep=":",
             header=None,
-            names=["Service Name", "Port", "Server", TODAY_COL],
+            names=["Key", TODAY_COL],
             engine="python",
         )
-        for col in KEY_COLS:
-            df[col] = df[col].astype(str).str.strip()
-        return df
+        df["Key"] = df["Key"].astype(str).str.strip()
+        return df.set_index("Key")[TODAY_COL]
     except Exception as e:
         print(f"[error] failed to parse {path}: {e}")
         return None
 
 
 # ---------------------------------------------------------------------------
-# STEP 3: merge into single master CSV, keyed on (Service, Port, Server)
+# STEP 3: append today's column to each category's wide master CSV
+# Handles:
+#   - a service/server/port that had NO hits today -> gets 0, not blank
+#   - a NEW service/server/port never seen before -> new row added,
+#     with 0 filled in for all past dates it didn't exist for
 # ---------------------------------------------------------------------------
 
-def load_existing():
-    if not os.path.exists(master_path):
-        return None
-    return pd.read_csv(master_path)
+def update_master_csv(txt_file, csv_file, index_label):
+    txt_path = os.path.join(script_dir, txt_file)
+    csv_path = os.path.join(script_dir, csv_file)
 
-
-def update_master():
-    all_new = []
-    for fname in COMBINED_FILES:
-        parsed = parse_combined_file(os.path.join(script_dir, fname))
-        if parsed is not None:
-            all_new.append(parsed)
-
-    if not all_new:
-        print("[warn] no new data parsed, skipping write")
+    new_series = parse_txt(txt_path)
+    if new_series is None:
         return
 
-    new_data = pd.concat(all_new, ignore_index=True)
-    # if the same combo appears in more than one file, sum today's counts
-    new_data = new_data.groupby(KEY_COLS, as_index=False)[TODAY_COL].sum()
-
-    existing = load_existing()
-    if existing is not None:
+    if os.path.exists(csv_path):
+        existing = pd.read_csv(csv_path, index_col=0)
+        existing.index.name = index_label
         existing = existing.drop(columns=[TODAY_COL], errors="ignore")  # re-run safe
-        merged = existing.merge(new_data, on=KEY_COLS, how="outer")
+
+        # outer join = keeps old rows not seen today AND adds new rows seen today
+        merged = existing.join(new_series, how="outer")
     else:
-        merged = new_data
+        merged = new_series.to_frame()
 
-    merged = merged.sort_values(KEY_COLS).reset_index(drop=True)
-    merged.to_csv(master_path, index=False)
+    # any gap (old row missing today's hits, or new row missing past dates) -> 0
+    merged = merged.fillna(0)
 
-    print(f"[ok] master file updated: {master_path}")
+    # keep whole-number counts, not 0.0 / 123.0
+    merged = merged.astype(int, errors="ignore")
+
+    merged.index.name = index_label
+    merged = merged.sort_index()
+    merged.to_csv(csv_path)
+    print(f"[ok] updated: {csv_path}")
+
+
+def update_all():
+    for txt_file, (csv_file, index_label) in FILE_MAP.items():
+        update_master_csv(txt_file, csv_file, index_label)
 
 
 # ---------------------------------------------------------------------------
@@ -113,4 +118,4 @@ def update_master():
 
 if __name__ == "__main__":
     run_all_scripts()
-    update_master()
+    update_all()
