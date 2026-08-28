@@ -1,135 +1,77 @@
 import os
 import subprocess
 import pandas as pd
-from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
+# Folder configuration
 script_dir = "/home/scripts/sql_queries/ace/"
 
-# 1. CHANGE THIS to your exact Master Excel file name
-master_excel_name = "Master_Volume_Report.xlsx" 
-master_excel_path = os.path.join(script_dir, master_excel_name)
-
-# 2. MAP YOUR FILES TO EXCEL TABS EXACTLY AS THEY APPEAR AT THE BOTTOM OF EXCEL
-# Format: "text_file_name.txt": "Exact_Excel_Tab_Name"
-file_to_sheet_map = {
-    "exp_Service.txt": "Servicewise_EXP",
-    "sys_Service.txt": "Servicewise_SYS",
-    "exp_server.txt": "Serverwise_EXP",
-    "sys_server.txt": "Serverwise_SYS",
-    "exp_port.txt": "Portwise",
-    "sys_port.txt": "Portwise" # Both port files point to the same stacked tab!
-}
-
-# ==========================================
-# STEP 1: RUN DATABASE EXTRACTIONS
-# ==========================================
+# Get all database extraction shell scripts to run
 scripts = [f for f in os.listdir(script_dir) if f.endswith(".sh")]
 
 def run_script(script):
-    """Runs a single shell query script cleanly."""
+    """Runs a single shell script cleanly."""
     script_path = os.path.join(script_dir, script)
     subprocess.run(["bash", script_path])
 
-# ==========================================
-# STEP 2: AUTOMATED LOOKUP ENGINE (VLOOKUP)
-# ==========================================
-def update_excel_vlookup():
-    print("🤖 Starting automated VLOOKUP processing...")
+def build_data_dump_excel():
+    """Combines all 6 text files into ONE clean dump sheet for easy Excel VLOOKUP."""
+    print("Gathering data from all text extracts...")
+    txt_files = [f for f in os.listdir(script_dir) if f.endswith(".txt")]
     
-    # Calculate yesterday's date format to match your headers (e.g., '27-Aug')
-    yesterday = datetime.now() - timedelta(days=1)
-    target_date_column = yesterday.strftime("%e-%b").strip() # Trims leading spaces from date
-    
-    if not os.path.exists(master_excel_path):
-        print(f"❌ Error: Master Excel file not found at: {master_excel_path}")
+    if not txt_files:
+        print("No data text files found!")
         return
 
-    # Load the workbook structure into Python memory
-    excel_file = pd.ExcelFile(master_excel_path)
-    all_sheets_data = {sheet: pd.read_excel(master_excel_path, sheet_name=sheet) for sheet in excel_file.sheet_names}
+    # This creates a small temporary file you can download to your laptop
+    dump_excel_file = os.path.join(script_dir, "today_dump.xlsx")
     
-    # Loop through each database text file generated last night
-    for text_filename, sheet_name in file_to_sheet_map.items():
-        text_file_path = os.path.join(script_dir, text_filename)
+    # We will combine all data into one single layout list
+    combined_master_list = []
+    
+    for txt_file in txt_files:
+        file_path = os.path.join(script_dir, txt_file)
         
-        if sheet_name not in all_sheets_data:
-            print(f"⚠️ Warning: Excel Tab [{sheet_name}] not found in workbook. Skipping.")
+        if os.path.getsize(file_path) == 0:
             continue
             
-        # Skip if database file doesn't exist or is empty
-        if not os.path.exists(text_file_path) or os.path.getsize(text_file_path) == 0:
-            print(f"ℹ️ Info: No fresh data found in {text_filename}. Skipping.")
-            continue
-            
-        print(f"🔍 Performing VLOOKUP for Tab: [{sheet_name}] using data from [{text_filename}]...")
-        df_master = all_sheets_data[sheet_name]
-        
-        # Make sure the target date column exists in the Excel sheet layout
-        if target_date_column not in df_master.columns:
-            print(f"➕ Adding missing date column header: [{target_date_column}] to [{sheet_name}]")
-            df_master[target_date_column] = None
-
         try:
-            # 1. Load fresh database rows into a fast lookup memory index
-            df_db = pd.read_csv(text_file_path, sep=",", names=["MATCH_KEY", "VOLUME"])
-            df_db["MATCH_KEY"] = df_db["MATCH_KEY"].astype(str).str.strip()
+            # 1. Read raw comma data from the DB text file
+            df = pd.read_csv(file_path, sep=",", names=["MATCH_KEY", "VOLUME"])
             
-            # Create a dictionary lookup map (This is exactly like Excel VLOOKUP)
-            db_lookup = dict(zip(df_db["MATCH_KEY"], df_db["VOLUME"]))
+            # 2. AUTOMATICALLY CLEAN DATA (Strip spaces and remove blanks)
+            df = df.dropna(subset=["MATCH_KEY"])
+            df["MATCH_KEY"] = df["MATCH_KEY"].astype(str).str.strip()
+            df = df[df["MATCH_KEY"] != ""]
             
-            # Identify the Column A label name (e.g., 'PORT EXP name', 'API Name')
-            column_a_name = df_master.columns[0]
+            # Remove trailing decimals from numbers if any exist (e.g. '4013.0' -> '4013')
+            df["MATCH_KEY"] = df["MATCH_KEY"].apply(lambda x: x[:-2] if x.endswith(".0") else x)
             
-            # 2. Iterate row-by-row down Column A to process lookups
-            for index, row in df_master.iterrows():
-                cell_value = str(row[column_a_name]).strip()
-                
-                # Skip calculations on empty spacing text or section titles
-                if cell_value in ["nan", "", "PORT EXP name", "PORT sys name"]:
-                    continue
-                
-                # Drop trailing decimals if Excel reads names as numbers (e.g. '4013.0' -> '4013')
-                if cell_value.endswith(".0"):
-                    cell_value = cell_value[:-2]
-                
-                # Check if the row item exists in yesterday's database records
-                if cell_value in db_lookup:
-                    # Match Found: Injected directly into the target date column cell location
-                    df_master.at[index, target_date_column] = int(db_lookup[cell_value])
-                else:
-                    # Missing Match: If cell is blank, print '0' instead of causing #N/A errors
-                    if pd.isna(df_master.at[index, target_date_column]):
-                        df_master.at[index, target_date_column] = 0
-                        
-            all_sheets_data[sheet_name] = df_master
+            combined_master_list.append(df)
+            print(f"Successfully processed and cleaned text file: [{txt_file}]")
             
         except Exception as e:
-            print(f"❌ VLOOKUP Error processing file {text_filename}: {e}")
-
-    # 3. Write all data frames back to their original Excel sheet tabs layout
-    print("💾 Saving all data back to Master Excel workbook...")
-    with pd.ExcelWriter(master_excel_path, engine='openpyxl') as writer:
-        for sheet, df_updated in all_sheets_data.items():
-            df_updated.to_excel(writer, sheet_name=sheet, index=False)
+            print(f"Could not process file {txt_file}: {e}")
             
-    print(f"✨ Automation Complete! Master template updated for: [{target_date_column}]")
+    if combined_master_list:
+        # Stack all 6 file contents on top of each other into one giant list
+        final_df = pd.concat(combined_master_list, ignore_index=True)
+        
+        # Save it into a single clean sheet
+        final_df.to_excel(dump_excel_file, sheet_name="Database_Data", index=False)
+        print(f"✨ Success! Your clean copy-paste dump file is ready at: {dump_excel_file}")
+    else:
+        print("No valid database records were found to merge.")
 
-# ==========================================
-# EXECUTION ENTRY POINT
-# ==========================================
 if __name__ == "__main__":
     try:
-        # Step A: Run background query extractions concurrently
+        # Step A: Run all queries in parallel
         with ThreadPoolExecutor() as executor:
-            print("🚀 Launching database extraction queries in parallel...")
+            print("Running database queries...")
             executor.map(run_script, scripts)
             
-        # Step B: Match and lock values into your Master Template
-        update_excel_vlookup()
+        # Step B: Clean and merge data into today_dump.xlsx
+        build_data_dump_excel()
         
     except Exception as overall_error:
-        print(f"💥 Process aborted: {overall_error}")
+        print(f"Process crashed: {overall_error}")
